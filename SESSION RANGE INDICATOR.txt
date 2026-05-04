@@ -1,0 +1,347 @@
+// ============================================================
+// SESSION RANGE INDICATOR
+// Asian · London · New York | Tight Range Detection | London Sweep Signals
+// Pine Script v5
+// ============================================================
+
+//@version=5
+indicator("Session Range Indicator [Asia · London · NY]", shorttitle="SRI", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=300)
+
+// ─────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────
+
+// Timezone
+i_tz = input.string("UTC", "Chart Timezone", options=["UTC", "America/New_York", "Europe/London", "Asia/Tokyo", "Asia/Singapore"], group="⚙️ Settings")
+
+// Asian Session
+i_asia_start    = input.int(0,  "Asian Start Hour (UTC)", minval=0, maxval=23, group="🌏 Asian Session")
+i_asia_end      = input.int(8,  "Asian End Hour (UTC)",   minval=0, maxval=23, group="🌏 Asian Session")
+i_asia_color    = input.color(color.new(#378ADD, 85), "Asian Range Color",  group="🌏 Asian Session")
+i_asia_border   = input.color(color.new(#378ADD, 40), "Asian Border Color", group="🌏 Asian Session")
+i_show_asia     = input.bool(true, "Show Asian Range",    group="🌏 Asian Session")
+
+// Tight Range
+i_tight_pips    = input.float(15.0, "Tight Range Threshold (pips)", minval=1, step=0.5, tooltip="Asian range is 'tight' when pip range is under this value. Auto-scales for JPY pairs (×100) and XAU.", group="🌏 Asian Session")
+i_tight_color   = input.color(color.new(#EF9F27, 75), "Tight Range Highlight", group="🌏 Asian Session")
+i_show_tight    = input.bool(true, "Highlight Tight Asian Range", group="🌏 Asian Session")
+
+// London Session
+i_ldn_start     = input.int(7,  "London Start Hour (UTC)", minval=0, maxval=23, group="🇬🇧 London Session")
+i_ldn_end       = input.int(16, "London End Hour (UTC)",   minval=0, maxval=23, group="🇬🇧 London Session")
+i_ldn_color     = input.color(color.new(#D85A30, 85), "London Range Color",  group="🇬🇧 London Session")
+i_ldn_border    = input.color(color.new(#D85A30, 40), "London Border Color", group="🇬🇧 London Session")
+i_show_ldn      = input.bool(true, "Show London Range", group="🇬🇧 London Session")
+
+// New York Session
+i_ny_start      = input.int(13, "NY Start Hour (UTC)", minval=0, maxval=23, group="🗽 New York Session")
+i_ny_end        = input.int(22, "NY End Hour (UTC)",   minval=0, maxval=23, group="🗽 New York Session")
+i_ny_color      = input.color(color.new(#639922, 85), "NY Range Color",  group="🗽 New York Session")
+i_ny_border     = input.color(color.new(#639922, 40), "NY Border Color", group="🗽 New York Session")
+i_show_ny       = input.bool(true, "Show NY Range", group="🗽 New York Session")
+
+// Sweep Signals
+i_show_sweep        = input.bool(true,  "Show London Sweep Signals", group="🎯 Sweep Signals")
+i_sweep_require_rej = input.bool(true,  "Require Candle Rejection (wick beyond range, close back inside)", group="🎯 Sweep Signals")
+i_sweep_bull_color  = input.color(color.new(#1D9E75, 0),  "Bullish Sweep Color", group="🎯 Sweep Signals")
+i_sweep_bear_color  = input.color(color.new(#E24B4A, 0),  "Bearish Sweep Color", group="🎯 Sweep Signals")
+i_sweep_label_size  = input.string("normal", "Label Size", options=["tiny","small","normal","large"], group="🎯 Sweep Signals")
+i_show_sweep_line   = input.bool(true, "Draw Sweep Level Line", group="🎯 Sweep Signals")
+
+// Labels & Lines
+i_show_labels       = input.bool(true, "Show Session Labels", group="🏷️ Display")
+i_show_midline      = input.bool(true, "Show Asian Midline (50% Level)", group="🏷️ Display")
+i_mid_color         = input.color(color.new(#378ADD, 60), "Midline Color", group="🏷️ Display")
+i_extend_levels     = input.bool(true, "Extend Asian H/L Lines Into London", group="🏷️ Display")
+i_lookback_days     = input.int(5, "Days to Draw (lookback)", minval=1, maxval=20, group="🏷️ Display")
+
+// ─────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────
+
+_hour() => hour(time, i_tz)
+_day()  => dayofweek(time, i_tz)
+
+in_session(h_start, h_end) =>
+    h = _hour()
+    h_start <= h_end ? (h >= h_start and h < h_end) : (h >= h_start or h < h_end)
+
+// Pip size auto-detection
+pip_size() =>
+    syminfo.mintick * (str.contains(syminfo.tickerid, "JPY") ? 100 : str.contains(syminfo.ticker, "XAU") ? 1 : 10)
+
+// Convert pips threshold to price
+pips_to_price(p) => p * pip_size()
+
+label_size_val() =>
+    i_sweep_label_size == "tiny"   ? size.tiny   :
+     i_sweep_label_size == "small"  ? size.small  :
+     i_sweep_label_size == "large"  ? size.large  : size.normal
+
+// ─────────────────────────────────────────────────────────────
+// SESSION TRACKING — persistent vars per session per day
+// ─────────────────────────────────────────────────────────────
+
+// We track: whether we are in the session, the session's running H/L,
+// the bar index when the session started, and whether we have already
+// drawn the box for this session occurrence.
+
+// ── ASIAN ──
+var float  asia_high       = na
+var float  asia_low        = na
+var int    asia_start_bar  = na
+var int    asia_end_bar    = na
+var bool   asia_active     = false
+var bool   asia_box_drawn  = false
+var box    asia_box        = na
+var line   asia_hi_line    = na
+var line   asia_lo_line    = na
+var line   asia_mid_line   = na
+var label  asia_label      = na
+var bool   asia_is_tight   = false
+
+// ── LONDON ──
+var float  ldn_high        = na
+var float  ldn_low         = na
+var int    ldn_start_bar   = na
+var bool   ldn_active      = false
+var box    ldn_box         = na
+var label  ldn_label       = na
+
+// ── NEW YORK ──
+var float  ny_high         = na
+var float  ny_low          = na
+var int    ny_start_bar    = na
+var bool   ny_active       = false
+var box    ny_box          = na
+var label  ny_label        = na
+
+// ── SWEEP tracking ──
+var bool   swept_high      = false
+var bool   swept_low       = false
+var float  last_asia_high  = na
+var float  last_asia_low   = na
+
+// Day boundary – used to reset sweep flags each new day
+var int    last_day        = na
+
+// ─────────────────────────────────────────────────────────────
+// LIMIT DRAWING TO lookback window
+// ─────────────────────────────────────────────────────────────
+
+bars_per_day    = 24 * 60 / timeframe.in_seconds(timeframe.period) * 60
+lookback_bars   = i_lookback_days * bars_per_day
+in_window       = bar_index >= last_bar_index - lookback_bars
+
+// ─────────────────────────────────────────────────────────────
+// ASIAN SESSION LOGIC
+// ─────────────────────────────────────────────────────────────
+
+in_asia     = in_session(i_asia_start, i_asia_end)
+asia_opens  = in_asia and not asia_active       // first bar of session
+asia_closes = not in_asia and asia_active       // first bar after session
+
+if asia_opens
+    asia_active     := true
+    asia_box_drawn  := false
+    asia_high       := high
+    asia_low        := low
+    asia_start_bar  := bar_index
+    swept_high      := false
+    swept_low       := false
+
+if asia_active and in_asia
+    asia_high := math.max(asia_high, high)
+    asia_low  := math.min(asia_low,  low)
+    asia_end_bar := bar_index
+
+if asia_closes
+    asia_active := false
+    last_asia_high := asia_high
+    last_asia_low  := asia_low
+    asia_is_tight  := (asia_high - asia_low) < pips_to_price(i_tight_pips)
+
+    if in_window and i_show_asia and not na(asia_start_bar)
+        _bg = asia_is_tight and i_show_tight ? i_tight_color : i_asia_color
+        asia_box := box.new(asia_start_bar, asia_high, asia_end_bar, asia_low,
+             border_color=i_asia_border, bgcolor=_bg, border_width=1)
+
+        if i_show_midline
+            _mid = (asia_high + asia_low) / 2
+            asia_mid_line := line.new(asia_start_bar, _mid, asia_end_bar, _mid,
+                 color=i_mid_color, style=line.style_dotted, width=1)
+
+        if i_show_labels
+            _tight_str = asia_is_tight ? " ⚡TIGHT" : ""
+            _pips_val  = (asia_high - asia_low) / pip_size()
+            _txt = "ASIA  " + str.tostring(math.round(_pips_val, 1)) + " pips" + _tight_str
+            asia_label := label.new(asia_end_bar, asia_high,
+                 text=_txt, style=label.style_label_lower_right,
+                 color=color.new(#378ADD, 80), textcolor=#042C53,
+                 size=size.small)
+
+        if i_extend_levels
+            asia_hi_line := line.new(asia_end_bar, asia_high, asia_end_bar + int(bars_per_day * 0.67), asia_high,
+                 color=i_asia_border, style=line.style_dashed, width=1)
+            asia_lo_line := line.new(asia_end_bar, asia_low,  asia_end_bar + int(bars_per_day * 0.67), asia_low,
+                 color=i_asia_border, style=line.style_dashed, width=1)
+
+    asia_box_drawn := true
+
+// ─────────────────────────────────────────────────────────────
+// LONDON SESSION LOGIC
+// ─────────────────────────────────────────────────────────────
+
+in_ldn      = in_session(i_ldn_start, i_ldn_end)
+ldn_opens   = in_ldn  and not ldn_active
+ldn_closes  = not in_ldn and ldn_active
+
+if ldn_opens
+    ldn_active    := true
+    ldn_high      := high
+    ldn_low       := low
+    ldn_start_bar := bar_index
+
+if ldn_active and in_ldn
+    ldn_high := math.max(ldn_high, high)
+    ldn_low  := math.min(ldn_low,  low)
+
+if ldn_closes
+    ldn_active := false
+    if in_window and i_show_ldn and not na(ldn_start_bar)
+        ldn_box := box.new(ldn_start_bar, ldn_high, bar_index - 1, ldn_low,
+             border_color=i_ldn_border, bgcolor=i_ldn_color, border_width=1)
+        if i_show_labels
+            _pips_val = (ldn_high - ldn_low) / pip_size()
+            ldn_label := label.new(bar_index - 1, ldn_high,
+                 text="LONDON  " + str.tostring(math.round(_pips_val, 1)) + " pips",
+                 style=label.style_label_lower_right,
+                 color=color.new(#D85A30, 80), textcolor=#4A1B0C,
+                 size=size.small)
+
+// ─────────────────────────────────────────────────────────────
+// NEW YORK SESSION LOGIC
+// ─────────────────────────────────────────────────────────────
+
+in_ny       = in_session(i_ny_start, i_ny_end)
+ny_opens    = in_ny  and not ny_active
+ny_closes   = not in_ny and ny_active
+
+if ny_opens
+    ny_active    := true
+    ny_high      := high
+    ny_low       := low
+    ny_start_bar := bar_index
+
+if ny_active and in_ny
+    ny_high := math.max(ny_high, high)
+    ny_low  := math.min(ny_low,  low)
+
+if ny_closes
+    ny_active := false
+    if in_window and i_show_ny and not na(ny_start_bar)
+        ny_box := box.new(ny_start_bar, ny_high, bar_index - 1, ny_low,
+             border_color=i_ny_border, bgcolor=i_ny_color, border_width=1)
+        if i_show_labels
+            _pips_val = (ny_high - ny_low) / pip_size()
+            ny_label := label.new(bar_index - 1, ny_high,
+                 text="NEW YORK  " + str.tostring(math.round(_pips_val, 1)) + " pips",
+                 style=label.style_label_lower_right,
+                 color=color.new(#639922, 80), textcolor=#173404,
+                 size=size.small)
+
+// ─────────────────────────────────────────────────────────────
+// LONDON SWEEP SIGNAL LOGIC
+// ─────────────────────────────────────────────────────────────
+// A sweep is when a London candle's wick pierces the Asian H or L
+// and — if rejection is required — the candle closes back on the
+// opposite side of that level (wick beyond, body inside or beyond).
+
+sweep_bull = false
+sweep_bear = false
+
+if i_show_sweep and in_ldn and not na(last_asia_high) and not na(last_asia_low)
+    // ── Bearish sweep: wick above Asian high, close below it ──
+    if not swept_high
+        if i_sweep_require_rej
+            if high > last_asia_high and close < last_asia_high
+                sweep_bear   := true
+                swept_high   := true
+        else
+            if high > last_asia_high
+                sweep_bear   := true
+                swept_high   := true
+
+    // ── Bullish sweep: wick below Asian low, close above it ──
+    if not swept_low
+        if i_sweep_require_rej
+            if low < last_asia_low and close > last_asia_low
+                sweep_bull   := true
+                swept_low    := true
+        else
+            if low < last_asia_low
+                sweep_bull   := true
+                swept_low    := true
+
+// ── Draw sweep labels ──
+if sweep_bear and in_window
+    label.new(bar_index, high,
+         text="▼  London swept Asian High",
+         style=label.style_label_down,
+         color=color.new(i_sweep_bear_color, 15),
+         textcolor=color.white,
+         size=label_size_val())
+    if i_show_sweep_line
+        line.new(bar_index - 3, last_asia_high, bar_index + 8, last_asia_high,
+             color=i_sweep_bear_color, style=line.style_solid, width=2)
+
+if sweep_bull and in_window
+    label.new(bar_index, low,
+         text="▲  London swept Asian Low",
+         style=label.style_label_up,
+         color=color.new(i_sweep_bull_color, 15),
+         textcolor=color.white,
+         size=label_size_val())
+    if i_show_sweep_line
+        line.new(bar_index - 3, last_asia_low, bar_index + 8, last_asia_low,
+             color=i_sweep_bull_color, style=line.style_solid, width=2)
+
+// ─────────────────────────────────────────────────────────────
+// PLOTS (for alert conditions & external scripts)
+// ─────────────────────────────────────────────────────────────
+
+plot(not na(last_asia_high) ? last_asia_high : na, title="Asian High",   color=color.new(#378ADD, 60), linewidth=1, style=plot.style_stepline)
+plot(not na(last_asia_low)  ? last_asia_low  : na, title="Asian Low",    color=color.new(#378ADD, 60), linewidth=1, style=plot.style_stepline)
+plot(ldn_active ? ldn_high : na,                    title="London High",  color=color.new(#D85A30, 60), linewidth=1, style=plot.style_stepline)
+plot(ldn_active ? ldn_low  : na,                    title="London Low",   color=color.new(#D85A30, 60), linewidth=1, style=plot.style_stepline)
+plot(ny_active  ? ny_high  : na,                    title="NY High",      color=color.new(#639922, 60), linewidth=1, style=plot.style_stepline)
+plot(ny_active  ? ny_low   : na,                    title="NY Low",       color=color.new(#639922, 60), linewidth=1, style=plot.style_stepline)
+
+plotshape(sweep_bull, title="Bullish Sweep Signal", location=location.belowbar,
+     style=shape.triangleup, color=i_sweep_bull_color, size=size.small)
+plotshape(sweep_bear, title="Bearish Sweep Signal", location=location.abovebar,
+     style=shape.triangledown, color=i_sweep_bear_color, size=size.small)
+
+// Tight range background (current live Asian session while forming)
+bgcolor(asia_active and asia_is_tight and i_show_tight ?
+     color.new(#EF9F27, 92) : na, title="Live Tight Asian Range BG")
+
+// ─────────────────────────────────────────────────────────────
+// ALERTS
+// ─────────────────────────────────────────────────────────────
+
+alertcondition(sweep_bull,
+     title="London Bullish Sweep",
+     message="{{ticker}} — London swept the Asian LOW with rejection. Potential bullish move. Asian low: {{plot_2}}")
+
+alertcondition(sweep_bear,
+     title="London Bearish Sweep",
+     message="{{ticker}} — London swept the Asian HIGH with rejection. Potential bearish move. Asian high: {{plot_1}}")
+
+alertcondition(sweep_bull or sweep_bear,
+     title="London Sweep (Any)",
+     message="{{ticker}} — London session sweep of Asian range detected.")
+
+alertcondition(asia_closes and asia_is_tight,
+     title="Asian Tight Range Formed",
+     message="{{ticker}} — Asian session closed TIGHT. Watch for London sweep. Range: {{plot_1}} – {{plot_2}}")
